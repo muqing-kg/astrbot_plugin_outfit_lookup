@@ -2,7 +2,7 @@
   "api_base_url": {
     "description": "识图 API 地址（识别服务所在地址）",
     "type": "string",
-    "default": "http://192.168.1.4:8390"
+    "default": ""
   },
   "enable_llm_body_detect": {
     "description": "未指定体型时，用当前默认对话模型（需支持图片）自动判断体型；关闭则混搜全部体型",
@@ -13,5 +13,10 @@
     "description": "返回候选数量",
     "type": "int",
     "default": 5
+  },
+  "low_confidence_threshold": {
+    "description": "低置信度阈值（百分比），低于此值时提示仅供参考",
+    "type": "int",
+    "default": 60
   }
 }
