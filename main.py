@@ -1,21 +1,29 @@
-import asyncio
+"""AstrBot 剑网3外观截图识别插件。
+
+命令（带不带 / 均可）：
+- 外观识别 [萝莉|正太|成女|成男] + 图片
+- 不指定体型时，若配置了多模态模型则自动判断体型并做最终核实对比
+"""
+
+from __future__ import annotations
+
 import base64
+import json
 import re
 import time
 from pathlib import Path
 
 import aiohttp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.core.message.components import Image, Reply
+import astrbot.api.message_components as Comp
 
 BODY_MAP = {
     "萝莉": "luoli", "成女": "chengnv", "成男": "chengnan", "正太": "zhengtai",
     "f1": "luoli", "f2": "chengnv", "m1": "zhengtai", "m2": "chengnan",
     "loli": "luoli",
 }
-BODY_PROMPT = {"luoli": "萝莉", "zhengtai": "正太", "chengnv": "成女", "chengnan": "成男"}
 MAX_CONCURRENT = 3
 WAIT_SECONDS = 60
 CANCEL_WORD = "撤销"
@@ -35,18 +43,26 @@ class OutfitLookupPlugin(Star):
         self.config = config
         self.api_base = str(config.get("api_base_url", "")).rstrip("/")
         self.top_k = int(config.get("top_k", 5))
-        self.enable_llm = bool(config.get("enable_llm_body_detect", True))
+        self.multimodal_model = str(config.get("multimodal_model_id", "")).strip()
         self.low_conf = float(config.get("low_confidence_threshold", 60.0))
         self._active = 0
         self._waiters: dict[str, dict] = {}
         self._pending: dict[str, dict] = {}
 
-    @filter.command("外观识别")
-    async def outfit_lookup(self, event: AstrMessageEvent, body_type: str = ""):
-        user_id = event.get_sender_id()
-        body_key = self.BODY_MAP.get(body_type.strip().lower(), "") if body_type else ""
+    # ==================== 命令入口 ====================
 
-        image_comp = self._find_image(event)
+    @filter.regex(r"^/?外观识别(?:\s|$)")
+    async def outfit_lookup(self, event: AstrMessageEvent):
+        user_id = event.get_sender_id()
+        message_chain = event.get_messages()
+        raw_text = "".join(
+            c.text for c in message_chain if hasattr(c, "text") and c.text
+        )
+        raw_text = re.sub(r"^/?外观识别", "", raw_text).strip()
+        parts = raw_text.split() if raw_text else []
+        body_key = self.BODY_MAP.get(parts[0].strip().lower(), "") if parts else ""
+
+        image_comp = self._find_image(message_chain)
         if image_comp is None:
             self._waiters[user_id] = {
                 "expire": time.time() + WAIT_SECONDS,
@@ -64,12 +80,12 @@ class OutfitLookupPlugin(Star):
     async def on_message(self, event: AstrMessageEvent):
         user_id = event.get_sender_id()
         text = (event.message_str or "").strip()
+        if not text or text.startswith("/") or re.match(r"^/?外观识别", text):
+            return
 
         waiter = self._waiters.get(user_id)
         pending = self._pending.get(user_id)
         if not waiter and not pending:
-            return
-        if text.startswith("外观识别"):
             return
 
         if waiter:
@@ -107,6 +123,8 @@ class OutfitLookupPlugin(Star):
                 yield event.plain_result("记录失败，请稍后再试。")
                 self._pending[user_id] = pending
 
+    # ==================== 识别主流程 ====================
+
     async def _run_recognition(self, event, image_comp, body_key, user_id):
         if self._active >= MAX_CONCURRENT:
             yield event.plain_result("当前识别任务较多，请稍后再试～")
@@ -119,10 +137,7 @@ class OutfitLookupPlugin(Star):
                 yield event.plain_result("图片读取失败，请重新发送。")
                 return
 
-            if not body_key and self.enable_llm:
-                body_key = await self._detect_body_by_llm(image_bytes) or ""
-
-            payload = {"top_k": self.top_k, "with_images": "1"}
+            payload = {"top_k": self.top_k}
             if body_key:
                 payload["body_type"] = body_key
             form = aiohttp.FormData()
@@ -144,74 +159,70 @@ class OutfitLookupPlugin(Star):
             yield event.plain_result("未识别到外观，请确认截图内容。")
             return
 
-        # 多模态最终对比
-        if self.enable_llm and results[0].get("candidate_image"):
-            candidates = [
-                {"name": r.get("name"), "candidate_image": r.get("candidate_image")}
-                for r in results
-                if r.get("candidate_image")
-            ]
-            pick = await self._recheck_by_llm(image_bytes, candidates)
-            if pick is not None and 0 < pick < len(results):
-                results.insert(0, results.pop(pick))
-
         archive_file = result.get("archive_file") or ""
         if archive_file:
             self._pending[user_id] = {"archive_file": archive_file, "results": results}
 
         yield event.plain_result(self._format(results))
 
-    async def _ask_multimodal(self, prompt: str, image_bytes_list: list[bytes]) -> str | None:
-        provider = self.context.get_using_provider()
+    # ==================== 多模态 ====================
+
+    def _get_multimodal_provider(self):
+        if not self.multimodal_model:
+            return None
+        for provider in self.context.get_all_providers():
+            if self.multimodal_model in (provider.provider_config.get("id", ""), provider.provider_config.get("model_config", {}).get("model", "")):
+                return provider
+        return self.context.get_using_provider() if self.context.get_using_provider() else None
+
+    async def _ask_multimodal(self, prompt: str, image_data_urls: list[str]) -> str | None:
+        provider = self._get_multimodal_provider()
         if provider is None:
             return None
-        data_urls = [
-            "data:image/jpeg;base64," + base64.b64encode(b).decode() for b in image_bytes_list
-        ]
         try:
-            reply = await provider.text_chat(prompt=prompt, session_id=None, image_urls=data_urls)
+            reply = await provider.text_chat(
+                prompt=prompt, session_id=None, image_urls=image_data_urls,
+            )
             return reply.completion_text or ""
         except Exception:
             logger.exception("多模态调用失败")
             return None
 
-    async def _detect_body_by_llm(self, image_bytes: bytes) -> str | None:
+    async def _detect_body_by_llm(self, image_data_url: str) -> str | None:
         text = await self._ask_multimodal(
             "这是剑网3游戏的角色截图。请判断角色体型，只回答以下四个词之一："
             "萝莉、正太、成女、成男。",
-            [image_bytes],
+            [image_data_url],
         )
         if not text:
             return None
         match = re.search(r"萝莉|正太|成女|成男", text)
         return BODY_MAP[match.group()] if match else None
 
-    async def _recheck_by_llm(self, image_bytes: bytes, candidates: list[dict]) -> int | None:
+    async def _recheck_by_llm(self, query_image_url: str, candidate_urls: list[str]) -> int | None:
         prompt = (
             "第 1 张图是查询截图，后面的图是候选外观参考图（按顺序为第 2、3…张）。"
             "请找出与查询截图穿着同一套服装（相同设计和颜色）的候选图，"
             "只回答该候选图的序号数字。"
         )
-        images = [image_bytes] + [
-            base64.b64decode(c["candidate_image"]) for c in candidates
-        ]
-        text = await self._ask_multimodal(prompt, images)
+        text = await self._ask_multimodal(prompt, [query_image_url] + candidate_urls)
         if not text:
             return None
         match = re.search(r"\d+", text)
         if not match:
             return None
         best = int(match.group())
-        return best - 2 if 2 <= best <= len(candidates) + 1 else None
+        return best - 2 if 2 <= best <= len(candidate_urls) + 1 else None
+
+    # ==================== 工具方法 ====================
 
     @staticmethod
-    def _find_image(event: AstrMessageEvent):
-        chain = event.get_messages().content
+    def _find_image(chain):
         for comp in chain:
-            if isinstance(comp, Image):
+            if isinstance(comp, Comp.Image):
                 return comp
         for comp in chain:
-            if not isinstance(comp, Reply):
+            if not isinstance(comp, Comp.Reply):
                 continue
             for attr in ("chain", "messages", "content"):
                 inner = getattr(comp, attr, None)
@@ -219,14 +230,14 @@ class OutfitLookupPlugin(Star):
                     continue
                 try:
                     for sub in inner:
-                        if isinstance(sub, Image):
+                        if isinstance(sub, Comp.Image):
                             return sub
                 except TypeError:
                     pass
         return None
 
     @staticmethod
-    async def _read_image(comp: Image) -> bytes | None:
+    async def _read_image(comp) -> bytes | None:
         try:
             if getattr(comp, "base64", None):
                 payload = comp.base64
@@ -236,8 +247,6 @@ class OutfitLookupPlugin(Star):
             if getattr(comp, "file", None) and str(comp.file).startswith("file://"):
                 return Path(str(comp.file)[7:]).read_bytes()
             if getattr(comp, "url", None) and str(comp.url).startswith("http"):
-                import aiohttp
-
                 async with aiohttp.ClientSession() as session:
                     async with session.get(str(comp.url), timeout=aiohttp.ClientTimeout(total=30)) as resp:
                         if resp.status == 200:
@@ -246,19 +255,6 @@ class OutfitLookupPlugin(Star):
         except Exception:
             logger.exception("图片读取失败")
             return None
-
-    async def _annotate(self, archive_file: str, correct: str) -> bool:
-        try:
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{self.api_base}/annotate",
-                    json={"file": archive_file, "name": correct},
-                ) as resp:
-                    return resp.status == 200
-        except Exception:
-            logger.exception("标注请求失败")
-            return False
 
     @staticmethod
     def _resolve_label(text: str, results: list[dict]) -> str | None:
@@ -287,3 +283,7 @@ class OutfitLookupPlugin(Star):
             "帮助改进识别；如果都不对，也可以直接发送正确的外观名称。"
         )
         return chr(10).join(lines)
+
+
+if __name__ == "__main__":
+    pass
