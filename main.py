@@ -37,7 +37,7 @@ LOW_CONFIDENCE = 60.0
     "astrbot_plugin_outfit_lookup",
     "沐倾",
     "剑网3外观截图识别：发送外观截图，返回外观名称。",
-    "1.2.0",
+    "1.2.1",
     "https://github.com/muqing-kg/astrbot_plugin_outfit_lookup",
 )
 class OutfitLookupPlugin(Star):
@@ -75,7 +75,7 @@ class OutfitLookupPlugin(Star):
 
     # ==================== 命令入口 ====================
 
-    @filter.regex(r"^/?外观识别(?:\s|$)")
+    @filter.regex(r"^/?外观识别(?:\s|$|\[)")
     async def outfit_lookup(self, event: AstrMessageEvent):
         user_id = event.get_sender_id()
         chain = event.get_messages()
