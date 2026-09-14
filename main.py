@@ -36,7 +36,7 @@ LOW_CONFIDENCE = 60.0
     "astrbot_plugin_outfit_lookup",
     "沐倾",
     "剑网3外观识别系统：发送外观截图，返回外观名称。",
-    "1.2.6",
+    "1.2.7",
     "https://github.com/muqing-kg/astrbot_plugin_outfit_lookup",
 )
 class OutfitLookupPlugin(Star):
@@ -162,8 +162,11 @@ class OutfitLookupPlugin(Star):
                 await self._reply(event, "图片读取失败，请重新发送。")
                 return
 
-            if not body_key and self._get_multimodal_provider() is not None:
+            provider_ready = self._get_multimodal_provider() is not None
+            data_url = ""
+            if provider_ready:
                 data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode()
+            if not body_key and provider_ready:
                 body_key = await self._detect_body_by_llm(data_url) or ""
                 logger.info(f"multimodal body detect: {body_key!r}")
 
@@ -190,6 +193,9 @@ class OutfitLookupPlugin(Star):
             await self._reply(event, "未识别到外观，请确认截图内容。")
             return
 
+        if provider_ready and len(results) >= 2:
+            await self._multimodal_reorder(data_url, results)
+
         archive_file = result.get("archive_file") or ""
         if archive_file:
             self._pending[user_id] = {
@@ -209,6 +215,59 @@ class OutfitLookupPlugin(Star):
             if self.multimodal_model in (provider.provider_config.get("id", ""), provider.provider_config.get("model_config", {}).get("model", "")):
                 return provider
         return self.context.get_using_provider() if self.context.get_using_provider() else None
+
+    async def _multimodal_reorder(self, data_url: str, results: list[dict]) -> None:
+        """多模态最终核实：下载候选参考图交模型挑选，选中者置顶。"""
+        sent: list[int] = []
+        urls: list[str] = []
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for idx, item in enumerate(results[:5]):
+                url = item.get("reference_url")
+                if not url:
+                    continue
+                try:
+                    async with session.get(f"{self.api_base}{url}") as resp:
+                        if resp.status != 200:
+                            continue
+                        blob = await resp.read()
+                except Exception:
+                    logger.exception("参考图下载失败")
+                    continue
+                mime = "image/png" if blob[:4] == b"\x89PNG" else "image/webp" if blob[:4] == b"RIFF" else "image/jpeg"
+                sent.append(idx)
+                urls.append(f"data:{mime};base64," + base64.b64encode(blob).decode())
+        if len(sent) < 2:
+            return
+        pick = await self._recheck_by_llm(data_url, urls)
+        logger.info(f"multimodal recheck pick={pick} candidates={sent}")
+        if pick is not None and pick < len(sent) and sent[pick]:
+            chosen = results.pop(sent[pick])
+            results.insert(0, chosen)
+
+    async def _recheck_by_llm(self, query_image_url: str, candidate_urls: list[str]) -> int | None:
+        provider = self._get_multimodal_provider()
+        if provider is None:
+            return None
+        try:
+            reply = await provider.text_chat(
+                prompt=(
+                    "第 1 张图是查询截图，后面的图是候选外观参考图（按顺序为第 2、3…张）。"
+                    "请找出与查询截图穿着同一套服装（相同设计和颜色）的候选图，"
+                    "只回答该候选图的序号数字。"
+                ),
+                session_id=None,
+                image_urls=[query_image_url] + candidate_urls,
+            )
+            text = reply.completion_text or ""
+        except Exception:
+            logger.exception("多模态调用失败")
+            return None
+        match = re.search(r"\d+", text)
+        if not match:
+            return None
+        best = int(match.group())
+        return best - 2 if 2 <= best <= len(candidate_urls) + 1 else None
 
     async def _detect_body_by_llm(self, image_data_url: str) -> str | None:
         provider = self._get_multimodal_provider()
