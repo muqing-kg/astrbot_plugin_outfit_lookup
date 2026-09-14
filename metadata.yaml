@@ -1,6 +1,6 @@
 name: astrbot_plugin_outfit_lookup
 display_name: 剑网3外观识别系统
 desc: 剑网3外观识别系统，发送外观截图返回外观名称；支持指定体型、引用取图与编号标注反馈
-version: v1.2.7
+version: v1.2.8
 repo: https://github.com/muqing-kg/astrbot_plugin_outfit_lookup
 author: 沐倾

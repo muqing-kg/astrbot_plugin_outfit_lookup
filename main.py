@@ -36,7 +36,7 @@ LOW_CONFIDENCE = 60.0
     "astrbot_plugin_outfit_lookup",
     "沐倾",
     "剑网3外观识别系统：发送外观截图，返回外观名称。",
-    "1.2.7",
+    "1.2.8",
     "https://github.com/muqing-kg/astrbot_plugin_outfit_lookup",
 )
 class OutfitLookupPlugin(Star):
@@ -193,8 +193,9 @@ class OutfitLookupPlugin(Star):
             await self._reply(event, "未识别到外观，请确认截图内容。")
             return
 
+        verdict = None
         if provider_ready and len(results) >= 2:
-            await self._multimodal_reorder(data_url, results)
+            verdict = await self._multimodal_verify(data_url, results)
 
         archive_file = result.get("archive_file") or ""
         if archive_file:
@@ -204,7 +205,7 @@ class OutfitLookupPlugin(Star):
                 "expire": time.time() + WAIT_SECONDS,
             }
 
-        await self._reply(event, self._format(results))
+        await self._reply(event, self._format(results, verdict))
 
     # ==================== 多模态 ====================
 
@@ -216,8 +217,8 @@ class OutfitLookupPlugin(Star):
                 return provider
         return self.context.get_using_provider() if self.context.get_using_provider() else None
 
-    async def _multimodal_reorder(self, data_url: str, results: list[dict]) -> None:
-        """多模态最终核实：下载候选参考图交模型挑选，选中者置顶。"""
+    async def _multimodal_verify(self, data_url: str, results: list[dict]) -> str | None:
+        """多模态最终核实：下载候选参考图交模型挑选，仅作参考提示，不改动排序。"""
         sent: list[int] = []
         urls: list[str] = []
         timeout = aiohttp.ClientTimeout(total=20)
@@ -241,9 +242,9 @@ class OutfitLookupPlugin(Star):
             return
         pick = await self._recheck_by_llm(data_url, urls)
         logger.info(f"multimodal recheck pick={pick} candidates={sent}")
-        if pick is not None and pick < len(sent) and sent[pick]:
-            chosen = results.pop(sent[pick])
-            results.insert(0, chosen)
+        if pick is not None and pick < len(sent):
+            return results[sent[pick]].get("name")
+        return None
 
     async def _recheck_by_llm(self, query_image_url: str, candidate_urls: list[str]) -> int | None:
         provider = self._get_multimodal_provider()
@@ -340,7 +341,7 @@ class OutfitLookupPlugin(Star):
         return text if text else None
 
     @staticmethod
-    def _format(results: list[dict]) -> str:
+    def _format(results: list[dict], verdict: str | None = None) -> str:
         if not results:
             return "未识别到外观，请确认截图内容。"
         top = results[0]
@@ -349,6 +350,8 @@ class OutfitLookupPlugin(Star):
         for i, item in enumerate(results[1:5], 2):
             p = item.get("probability_percent")
             lines.append(f"{i}.{item.get('name', '未知')} 相似度{p}%")
+        if verdict and verdict != top.get("name"):
+            lines.append(f"模型核实：最像的是「{verdict}」（仅供参考）")
         if percent < LOW_CONFIDENCE:
             lines.append("")
             lines.append("置信度较低，结果仅供参考。")
