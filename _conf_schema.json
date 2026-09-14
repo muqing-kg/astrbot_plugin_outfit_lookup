@@ -15,9 +15,10 @@
     "default": 60
   },
   "multimodal_model_id": {
-    "description": "多模态模型 ID（留空则不使用多模态；填写后用于体型判断和候选对比）",
+    "description": "多模态模型 ID",
     "type": "string",
-    "default": "",
-    "hint": "填写 astrbot 中已配置的支持图片的模型 ID"
+    "hint": "用于体型判断和候选对比的多模态 Provider。留空则不使用多模态。",
+    "_special": "select_provider",
+    "default": ""
   }
 }
