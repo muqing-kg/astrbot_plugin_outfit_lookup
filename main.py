@@ -35,8 +35,8 @@ LOW_CONFIDENCE = 60.0
 @register(
     "astrbot_plugin_outfit_lookup",
     "沐倾",
-    "剑网3外观截图识别：发送外观截图，返回外观名称。",
-    "1.2.3",
+    "剑网3外观识别系统：发送外观截图，返回外观名称。",
+    "1.2.4",
     "https://github.com/muqing-kg/astrbot_plugin_outfit_lookup",
 )
 class OutfitLookupPlugin(Star):
@@ -84,6 +84,7 @@ class OutfitLookupPlugin(Star):
         body_key = BODY_MAP.get(parts[0].strip().lower(), "") if parts else ""
 
         image_comp = self._find_image(chain)
+        logger.info(f"outfit_lookup trigger: image={'Y' if image_comp else 'N'} body={body_key!r}")
         if image_comp is None:
             self._waiters[user_id] = {
                 "expire": time.time() + WAIT_SECONDS,
@@ -125,7 +126,12 @@ class OutfitLookupPlugin(Star):
                 await self._reply(event, "请发送图片，或发送「撤销」取消。")
             return
 
-        if pending and text:
+        if pending:
+            if time.time() > pending["expire"]:
+                del self._pending[user_id]
+                return
+            if not text:
+                return
             del self._pending[user_id]
             correct = self._resolve_label(text, pending["results"])
             if correct is None:
@@ -170,6 +176,7 @@ class OutfitLookupPlugin(Star):
                 async with session.post(
                     f"{self.api_base}/recognize", params=payload, data=form
                 ) as resp:
+                    logger.info(f"recognize http={resp.status}")
                     if resp.status != 200:
                         await self._reply(event, "识别服务暂时不可用，请稍后再试。")
                         return
@@ -184,7 +191,11 @@ class OutfitLookupPlugin(Star):
 
         archive_file = result.get("archive_file") or ""
         if archive_file:
-            self._pending[user_id] = {"archive_file": archive_file, "results": results}
+            self._pending[user_id] = {
+                "archive_file": archive_file,
+                "results": results,
+                "expire": time.time() + WAIT_SECONDS,
+            }
 
         await self._reply(event, self._format(results))
 
