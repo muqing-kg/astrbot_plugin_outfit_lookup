@@ -1,14 +1,17 @@
 """AstrBot 剑网3外观截图识别插件。
 
 命令（带不带 / 均可）：
-- 外观识别 [萝莉|正太|成女|成男] + 图片
-- 不指定体型时，若配置了多模态模型则自动判断体型并做最终核实对比
+- 外观识别 [萝莉|正太|成女|成男] + 图片（支持同消息图片、引用消息中的图片）
+- 命令不带图片时进入等待状态，60 秒内仅接收同一用户发送的图片
+- 不指定体型时，若配置了多模态模型则自动判断体型
+
+回复方式：参考 astrbot_plugin_jx3box 直发消息链，
+不经 AstrBot 结果装饰（无 @ / 引用 / 前缀等任何附加），处理完即 stop_event。
 """
 
 from __future__ import annotations
 
 import base64
-import json
 import re
 import time
 from pathlib import Path
@@ -34,7 +37,7 @@ LOW_CONFIDENCE = 60.0
     "astrbot_plugin_outfit_lookup",
     "沐倾",
     "剑网3外观截图识别：发送外观截图，返回外观名称。",
-    "1.1.0",
+    "1.2.0",
     "https://github.com/muqing-kg/astrbot_plugin_outfit_lookup",
 )
 class OutfitLookupPlugin(Star):
@@ -49,93 +52,114 @@ class OutfitLookupPlugin(Star):
         self._waiters: dict[str, dict] = {}
         self._pending: dict[str, dict] = {}
 
+    # ==================== 直发回复 ====================
+
+    async def _reply(self, event: AstrMessageEvent, text: str) -> None:
+        await self._reply_chain(event, [Comp.Plain(text)])
+
+    async def _reply_chain(self, event: AstrMessageEvent, comps: list) -> None:
+        """直发消息：不经 AstrBot 结果装饰（无 @ / 引用 / 前缀等任何附加）。"""
+        chain = MessageChain(chain=comps)
+        try:
+            await event.send(chain)
+        except Exception:
+            logger.exception("direct send failed, fallback to context.send_message")
+            try:
+                await self.context.send_message(str(event.unified_msg_origin), chain)
+            except Exception:
+                logger.exception("fallback send failed")
+        try:
+            event.stop_event()
+        except Exception:
+            pass
+
     # ==================== 命令入口 ====================
 
     @filter.regex(r"^/?外观识别(?:\s|$)")
     async def outfit_lookup(self, event: AstrMessageEvent):
         user_id = event.get_sender_id()
-        message_chain = event.get_messages()
-        raw_text = "".join(
-            c.text for c in message_chain if hasattr(c, "text") and c.text
-        )
+        chain = event.get_messages()
+        raw_text = "".join(c.text for c in chain if getattr(c, "text", None))
         raw_text = re.sub(r"^/?外观识别", "", raw_text).strip()
         parts = raw_text.split() if raw_text else []
         body_key = self.BODY_MAP.get(parts[0].strip().lower(), "") if parts else ""
 
-        image_comp = self._find_image(message_chain)
+        image_comp = self._find_image(chain)
         if image_comp is None:
             self._waiters[user_id] = {
                 "expire": time.time() + WAIT_SECONDS,
                 "body_key": body_key,
             }
-            yield event.plain_result(
-                f"请在 {WAIT_SECONDS} 秒内发送要识别的图片（发送「{CANCEL_WORD}」取消）"
+            await self._reply(
+                event,
+                f"请在 {WAIT_SECONDS} 秒内发送要识别的图片（发送「{CANCEL_WORD}」取消）",
             )
             return
-
-        async for msg in self._run_recognition(event, image_comp, body_key, user_id):
-            yield msg
+        await self._recognize_and_reply(event, image_comp, body_key, user_id)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         user_id = event.get_sender_id()
-        text = (event.message_str or "").strip()
-        if not text or text.startswith("/") or re.match(r"^/?外观识别", text):
-            return
-
         waiter = self._waiters.get(user_id)
         pending = self._pending.get(user_id)
         if not waiter and not pending:
+            return
+        text = (event.message_str or "").strip()
+        if text.startswith("/") or re.match(r"^/?外观识别", text):
             return
 
         if waiter:
             if time.time() > waiter["expire"]:
                 del self._waiters[user_id]
-                yield event.plain_result("等待已超时，请重新发送「外观识别」。")
+                await self._reply(event, "等待已超时，请重新发送「外观识别」。")
                 return
             if text == CANCEL_WORD:
                 del self._waiters[user_id]
-                yield event.plain_result("已取消识别。")
+                await self._reply(event, "已取消识别。")
                 return
-            image_comp = self._find_image(event)
+            image_comp = self._find_image(event.get_messages())
             if image_comp is not None:
                 del self._waiters[user_id]
                 body_key = waiter.get("body_key") or ""
-                async for msg in self._run_recognition(event, image_comp, body_key, user_id):
-                    yield msg
+                await self._recognize_and_reply(event, image_comp, body_key, user_id)
             elif text:
-                yield event.plain_result("请发送图片，或发送「撤销」取消。")
+                await self._reply(event, "请发送图片，或发送「撤销」取消。")
             return
 
         if pending and text:
             del self._pending[user_id]
             correct = self._resolve_label(text, pending["results"])
             if correct is None:
-                yield event.plain_result(
-                    "编号超出范围，请发送列表中的编号，或直接发送正确的外观名称。"
+                await self._reply(
+                    event,
+                    "编号超出范围，请发送列表中的编号，或直接发送正确的外观名称。",
                 )
                 self._pending[user_id] = pending
                 return
             ok = await self._annotate(pending["archive_file"], correct)
             if ok:
-                yield event.plain_result(f"已记录：{correct}\n感谢反馈，这将帮助改进识别～")
+                await self._reply(event, f"已记录：{correct}\n感谢反馈，这将帮助改进识别～")
             else:
-                yield event.plain_result("记录失败，请稍后再试。")
+                await self._reply(event, "记录失败，请稍后再试。")
                 self._pending[user_id] = pending
 
     # ==================== 识别主流程 ====================
 
-    async def _run_recognition(self, event, image_comp, body_key, user_id):
+    async def _recognize_and_reply(self, event, image_comp, body_key, user_id):
         if self._active >= MAX_CONCURRENT:
-            yield event.plain_result("当前识别任务较多，请稍后再试～")
+            await self._reply(event, "当前识别任务较多，请稍后再试～")
             return
         self._active += 1
         try:
-            yield event.plain_result("正在识别中...请耐心等待")
+            await self._reply(event, "正在识别中...请耐心等待")
             image_bytes = await self._read_image(image_comp)
             if image_bytes is None:
-                yield event.plain_result("图片读取失败，请重新发送。")
+                await self._reply(event, "图片读取失败，请重新发送。")
                 return
+
+            if not body_key and self._get_multimodal_provider() is not None:
+                data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode()
+                body_key = await self._detect_body_by_llm(data_url) or ""
 
             payload = {"top_k": self.top_k}
             if body_key:
@@ -148,7 +172,7 @@ class OutfitLookupPlugin(Star):
                     f"{self.api_base}/recognize", params=payload, data=form
                 ) as resp:
                     if resp.status != 200:
-                        yield event.plain_result("识别服务暂时不可用，请稍后再试。")
+                        await self._reply(event, "识别服务暂时不可用，请稍后再试。")
                         return
                     result = await resp.json()
         finally:
@@ -156,14 +180,14 @@ class OutfitLookupPlugin(Star):
 
         results = result.get("results") or []
         if not results:
-            yield event.plain_result("未识别到外观，请确认截图内容。")
+            await self._reply(event, "未识别到外观，请确认截图内容。")
             return
 
         archive_file = result.get("archive_file") or ""
         if archive_file:
             self._pending[user_id] = {"archive_file": archive_file, "results": results}
 
-        yield event.plain_result(self._format(results))
+        await self._reply(event, self._format(results))
 
     # ==================== 多模态 ====================
 
@@ -175,44 +199,25 @@ class OutfitLookupPlugin(Star):
                 return provider
         return self.context.get_using_provider() if self.context.get_using_provider() else None
 
-    async def _ask_multimodal(self, prompt: str, image_data_urls: list[str]) -> str | None:
+    async def _detect_body_by_llm(self, image_data_url: str) -> str | None:
         provider = self._get_multimodal_provider()
         if provider is None:
             return None
         try:
             reply = await provider.text_chat(
-                prompt=prompt, session_id=None, image_urls=image_data_urls,
+                prompt=(
+                    "这是剑网3游戏的角色截图。请判断角色体型，只回答以下四个词之一："
+                    "萝莉、正太、成女、成男。"
+                ),
+                session_id=None,
+                image_urls=[image_data_url],
             )
-            return reply.completion_text or ""
+            text = reply.completion_text or ""
         except Exception:
             logger.exception("多模态调用失败")
             return None
-
-    async def _detect_body_by_llm(self, image_data_url: str) -> str | None:
-        text = await self._ask_multimodal(
-            "这是剑网3游戏的角色截图。请判断角色体型，只回答以下四个词之一："
-            "萝莉、正太、成女、成男。",
-            [image_data_url],
-        )
-        if not text:
-            return None
         match = re.search(r"萝莉|正太|成女|成男", text)
         return BODY_MAP[match.group()] if match else None
-
-    async def _recheck_by_llm(self, query_image_url: str, candidate_urls: list[str]) -> int | None:
-        prompt = (
-            "第 1 张图是查询截图，后面的图是候选外观参考图（按顺序为第 2、3…张）。"
-            "请找出与查询截图穿着同一套服装（相同设计和颜色）的候选图，"
-            "只回答该候选图的序号数字。"
-        )
-        text = await self._ask_multimodal(prompt, [query_image_url] + candidate_urls)
-        if not text:
-            return None
-        match = re.search(r"\d+", text)
-        if not match:
-            return None
-        best = int(match.group())
-        return best - 2 if 2 <= best <= len(candidate_urls) + 1 else None
 
     # ==================== 工具方法 ====================
 
@@ -224,16 +229,12 @@ class OutfitLookupPlugin(Star):
         for comp in chain:
             if not isinstance(comp, Comp.Reply):
                 continue
-            for attr in ("chain", "messages", "content"):
-                inner = getattr(comp, attr, None)
-                if not inner:
-                    continue
-                try:
-                    for sub in inner:
-                        if isinstance(sub, Comp.Image):
-                            return sub
-                except TypeError:
-                    pass
+            inner_chain = getattr(comp, "chain", None)
+            if not inner_chain:
+                continue
+            for sub in inner_chain:
+                if isinstance(sub, Comp.Image):
+                    return sub
         return None
 
     @staticmethod
@@ -255,6 +256,21 @@ class OutfitLookupPlugin(Star):
         except Exception:
             logger.exception("图片读取失败")
             return None
+
+    async def _annotate(self, archive_file: str, correct: str) -> bool:
+        if not self.api_base:
+            return False
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.api_base}/annotate",
+                    json={"file": archive_file, "name": correct},
+                ) as resp:
+                    return resp.status == 200
+        except Exception:
+            logger.exception("标注请求失败")
+            return False
 
     @staticmethod
     def _resolve_label(text: str, results: list[dict]) -> str | None:
