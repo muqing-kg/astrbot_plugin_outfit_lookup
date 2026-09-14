@@ -1,5 +1,5 @@
 author: 沐倾
 name: astrbot_plugin_outfit_lookup
 desc: 剑网3外观截图识别，发送外观截图返回外观名称
-version: v1.2.2
+version: v1.2.3
 repo: https://github.com/muqing-kg/astrbot_plugin_outfit_lookup

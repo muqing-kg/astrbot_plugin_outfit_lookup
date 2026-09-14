@@ -36,7 +36,7 @@ LOW_CONFIDENCE = 60.0
     "astrbot_plugin_outfit_lookup",
     "沐倾",
     "剑网3外观截图识别：发送外观截图，返回外观名称。",
-    "1.2.2",
+    "1.2.3",
     "https://github.com/muqing-kg/astrbot_plugin_outfit_lookup",
 )
 class OutfitLookupPlugin(Star):
@@ -81,7 +81,7 @@ class OutfitLookupPlugin(Star):
         raw_text = "".join(c.text for c in chain if getattr(c, "text", None))
         raw_text = re.sub(r"^/?外观识别", "", raw_text).strip()
         parts = raw_text.split() if raw_text else []
-        body_key = self.BODY_MAP.get(parts[0].strip().lower(), "") if parts else ""
+        body_key = BODY_MAP.get(parts[0].strip().lower(), "") if parts else ""
 
         image_comp = self._find_image(chain)
         if image_comp is None:
