@@ -14,7 +14,6 @@ from __future__ import annotations
 import base64
 import re
 import time
-from pathlib import Path
 
 import aiohttp
 from astrbot.api import AstrBotConfig, logger
@@ -37,7 +36,7 @@ LOW_CONFIDENCE = 60.0
     "astrbot_plugin_outfit_lookup",
     "沐倾",
     "剑网3外观截图识别：发送外观截图，返回外观名称。",
-    "1.2.1",
+    "1.2.2",
     "https://github.com/muqing-kg/astrbot_plugin_outfit_lookup",
 )
 class OutfitLookupPlugin(Star):
@@ -240,19 +239,8 @@ class OutfitLookupPlugin(Star):
     @staticmethod
     async def _read_image(comp) -> bytes | None:
         try:
-            if getattr(comp, "base64", None):
-                payload = comp.base64
-                if "," in payload:
-                    payload = payload.split(",", 1)[1]
-                return base64.b64decode(payload)
-            if getattr(comp, "file", None) and str(comp.file).startswith("file://"):
-                return Path(str(comp.file)[7:]).read_bytes()
-            if getattr(comp, "url", None) and str(comp.url).startswith("http"):
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(str(comp.url), timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                        if resp.status == 200:
-                            return await resp.read()
-            return None
+            b64 = await comp.convert_to_base64()
+            return base64.b64decode(b64)
         except Exception:
             logger.exception("图片读取失败")
             return None
