@@ -36,7 +36,7 @@ LOW_CONFIDENCE = 60.0
     "astrbot_plugin_outfit_lookup",
     "沐倾",
     "剑网3外观识别系统：发送外观截图，返回外观名称。",
-    "1.2.4",
+    "1.2.5",
     "https://github.com/muqing-kg/astrbot_plugin_outfit_lookup",
 )
 class OutfitLookupPlugin(Star):
@@ -165,6 +165,7 @@ class OutfitLookupPlugin(Star):
             if not body_key and self._get_multimodal_provider() is not None:
                 data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode()
                 body_key = await self._detect_body_by_llm(data_url) or ""
+                logger.info(f"multimodal body detect: {body_key!r}")
 
             payload = {"top_k": self.top_k}
             if body_key:
@@ -286,7 +287,7 @@ class OutfitLookupPlugin(Star):
         top = results[0]
         percent = top.get("probability_percent") or 0
         lines = ["识别完成", "", f"1.{top.get('name', '未知')} 相似度{percent}%"]
-        for i, item in enumerate(results[1:4], 2):
+        for i, item in enumerate(results[1:5], 2):
             p = item.get("probability_percent")
             lines.append(f"{i}.{item.get('name', '未知')} 相似度{p}%")
         if percent < LOW_CONFIDENCE:
